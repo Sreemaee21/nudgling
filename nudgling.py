@@ -12,7 +12,7 @@ pet whose mood follows your sessions:
 
 Done / needs-input events also fire a desktop notification + sound.
 
-Pets: blob (default), cat, ghost, robot. Pick one with --pet NAME,
+Pets: blob (default), cat, ghost, robot, oswald (an octopus). Pick one with --pet NAME,
 NUDGLING_PET=NAME, or the right-click menu (your choice is remembered).
 
 Controls: drag to move · click a session row to dismiss it · right-click for menu.
@@ -22,7 +22,7 @@ Config (env vars or ~/.config/nudgling/config.env):
     NUDGLING_PORT    default 8765
     NUDGLING_BIND    default 0.0.0.0 (set to your Tailscale IP to restrict)
     NUDGLING_SOUND   1/0, default 1
-    NUDGLING_PET     blob | cat | ghost | robot
+    NUDGLING_PET     blob | cat | ghost | robot | oswald
 
 Other commands:
     nudgling --demo            run through all moods with fake sessions
@@ -39,7 +39,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 CONFIG_DIR = os.path.expanduser("~/.config/nudgling")
 
@@ -333,7 +333,48 @@ def draw_robot(p, mood, t, blinking):
     props(p, cx, top, mood, t, col)
 
 
-PETS = {"blob": draw_blob, "cat": draw_cat, "ghost": draw_ghost, "robot": draw_robot}
+def lighten(hex_color, f):
+    r, g, b = (int(hex_color[i:i + 2], 16) for i in (1, 3, 5))
+    return "#%02x%02x%02x" % tuple(int(c + (255 - c) * f) for c in (r, g, b))
+
+
+def draw_oswald(p, mood, t, blinking):
+    """Oswald the octopus: his tentacles show how busy Claude is."""
+    cx, base, col = PET_W / 2, PET_H - 10, MOOD_COLOR[mood]
+    dy = bounce(mood, t) * 0.6
+    top = base - 60 + dy
+    amp, speed = {"idle": (1, 1), "working": (3, 6), "done": (2, 4), "attention": (3, 10)}[mood]
+    p.oval(cx - 28, base - 3, cx + 28, base + 5, fill=SHADOW)
+    for i in range(5):
+        k = i - 2
+        rx, ry = cx + k * 8, top + 38
+        d = 1 if k >= 0 else -1
+        wig = math.sin(t * speed + i * 1.3) * amp
+        # waving arms: both up to cheer when done, one up to say "hey!" when he needs you
+        raised = (mood == "done" and abs(k) == 2) or (mood == "attention" and k == -2)
+        if raised:
+            lift = math.sin(t * speed) * 4
+            pts = [rx, ry, rx + d * 16, ry - 4, rx + d * 22 + wig, top + 10 + lift,
+                   rx + d * 16 + wig, top + 4 + lift]
+        elif mood == "idle":  # limp, sprawled out
+            pts = [rx, ry, rx + k * 6, base - 2, rx + k * 11 + wig, base,
+                   rx + k * 11 + d * 5, base - 4]
+        else:
+            ex = cx + k * 15
+            pts = [rx, ry, (rx + ex) / 2 + wig, base - 10, ex - wig, base - 1,
+                   ex + d * 6, base - 6 + wig * 0.5]
+        p.line(pts, fill=col, width=6, smooth=True)
+    # head
+    p.oval(cx - 25, top, cx + 25, top + 46, fill=col)
+    spot = lighten(col, 0.35)
+    for sx, sy, r in ((-12, 7, 3.5), (-4, 4, 2), (11, 6, 2.5)):
+        p.oval(cx + sx - r, top + sy - r, cx + sx + r, top + sy + r, fill=spot)
+    face(p, cx, top + 26, mood, t, blinking, gap=10)
+    props(p, cx, top, mood, t, col, bang=1)
+
+
+PETS = {"blob": draw_blob, "cat": draw_cat, "ghost": draw_ghost, "robot": draw_robot,
+        "oswald": draw_oswald}
 
 
 def draw_pet(p, pet, mood, t, blinking=False):

@@ -8,12 +8,12 @@ Your pet's mood follows your sessions: sleepy when nothing is going on, busy whi
 
 ## Pick your pet
 
-<p align="center"><img src="docs/pets.svg" width="510" alt="four pets (blob, cat, ghost, robot) shown in each mood: sleepy, working, done, needs you"></p>
+<p align="center"><img src="docs/pets.svg" width="510" alt="five pets (blob, cat, ghost, robot, and Oswald the octopus) shown in each mood: sleepy, working, done, needs you"></p>
 
 Choose with any of these:
 
 - **right-click** the widget → **Pet**. Your choice is remembered.
-- `nudgling --pet cat`
+- `nudgling --pet oswald`
 - `NUDGLING_PET=ghost` in `~/.config/nudgling/config.env`
 
 ## How it works
@@ -93,7 +93,7 @@ Widget (`~/.config/nudgling/config.env` or env vars):
 | `NUDGLING_PORT` | `8765` | listen port |
 | `NUDGLING_BIND` | `0.0.0.0` | set to your Tailscale IP to listen only there |
 | `NUDGLING_SOUND` | `1` | `0` to mute |
-| `NUDGLING_PET` | `blob` | `blob`, `cat`, `ghost` or `robot` |
+| `NUDGLING_PET` | `blob` | `blob`, `cat`, `ghost`, `robot` or `oswald` |
 
 Hook (`~/.config/nudgling/hook.env`): `NUDGLING_URL`, `NUDGLING_TOKEN`.
 

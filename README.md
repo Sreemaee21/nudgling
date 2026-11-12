@@ -44,7 +44,7 @@ sudo pacman -S tk libnotify          # Arch
 sudo apt install python3-tk libnotify-bin   # Debian/Ubuntu
 sudo dnf install python3-tkinter libnotify  # Fedora
 
-git clone https://github.com/<you>/nudgling && cd nudgling
+git clone https://github.com/Sreemaee21/nudgling && cd nudgling
 install -Dm755 nudgling.py ~/.local/bin/nudgling
 
 mkdir -p ~/.config/nudgling
@@ -67,7 +67,7 @@ If a firewall is running, allow the port on your tailnet only, for example `sudo
 ### 2. On the machine running Claude Code
 
 ```bash
-git clone https://github.com/<you>/nudgling && cd nudgling
+git clone https://github.com/Sreemaee21/nudgling && cd nudgling
 python3 hooks/install-hooks.py \
   --url http://<desktop-tailscale-ip>:8765/event \
   --token <token from step 1>

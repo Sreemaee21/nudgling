@@ -1,0 +1,11 @@
+[Unit]
+Description=nudgling - Claude Code desktop pet
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+ExecStart=/usr/bin/env python3 %h/.local/bin/nudgling
+Restart=on-failure
+
+[Install]
+WantedBy=graphical-session.target

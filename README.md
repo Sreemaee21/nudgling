@@ -2,25 +2,19 @@
 
 A tiny desktop pet for Linux that nudges you when **Claude Code** is done, even when Claude runs on another machine you SSH into (in tmux, on a server, wherever).
 
-```
-  ╭──────────────────────────────╮
-  │   (^ ^)  nudgling            │
-  │   ╰─╯    all done!           │
-  │ ✔ webapp · dev:1   done · 4s │
-  │ ! api · dev:2  needs you · 1m│
-  ╰──────────────────────────────╯
-```
+<p align="center"><img src="docs/widget.svg" width="280" alt="the nudgling widget: a happy green blob above two Claude sessions, one done and one needing input"></p>
 
-The blob's mood follows your sessions:
+Your pet's mood follows your sessions: sleepy when nothing is going on, busy while Claude works, bouncing when Claude finishes, and alarmed when Claude needs your input or permission. "Done" and "needs you" also fire a desktop notification and a sound.
 
-| mood | face | meaning |
-|---|---|---|
-| sleepy | `- -` | nothing going on |
-| busy | `o o` | Claude is working |
-| happy | `^ ^` | Claude finished (bounces!) |
-| alarmed | `O O` | Claude needs your input or permission |
+## Pick your pet
 
-"Done" and "needs you" also fire a desktop notification and a sound.
+<p align="center"><img src="docs/pets.svg" width="510" alt="four pets (blob, cat, ghost, robot) shown in each mood: sleepy, working, done, needs you"></p>
+
+Choose with any of these:
+
+- **right-click** the widget → **Pet**. Your choice is remembered.
+- `nudgling --pet cat`
+- `NUDGLING_PET=ghost` in `~/.config/nudgling/config.env`
 
 ## How it works
 
@@ -52,7 +46,7 @@ echo "NUDGLING_TOKEN=$(python3 -c 'import secrets;print(secrets.token_hex(16))')
 chmod 600 ~/.config/nudgling/config.env
 cat ~/.config/nudgling/config.env    # copy this token for step 2
 
-nudgling --demo    # watch the pet go through its moods
+nudgling --demo    # watch the pet go through its moods (add --pet cat to try another)
 ```
 
 Start it at login with systemd:
@@ -87,7 +81,7 @@ It works for Claude on the same machine too: use `http://127.0.0.1:8765/event`.
 
 - **drag** to move the pet
 - **click** a session row to dismiss it
-- **right-click** to quit
+- **right-click** for the menu: switch pet, clear sessions, quit
 
 ## Config
 
@@ -99,6 +93,7 @@ Widget (`~/.config/nudgling/config.env` or env vars):
 | `NUDGLING_PORT` | `8765` | listen port |
 | `NUDGLING_BIND` | `0.0.0.0` | set to your Tailscale IP to listen only there |
 | `NUDGLING_SOUND` | `1` | `0` to mute |
+| `NUDGLING_PET` | `blob` | `blob`, `cat`, `ghost` or `robot` |
 
 Hook (`~/.config/nudgling/hook.env`): `NUDGLING_URL`, `NUDGLING_TOKEN`.
 
@@ -106,6 +101,14 @@ Hook (`~/.config/nudgling/hook.env`): `NUDGLING_URL`, `NUDGLING_TOKEN`.
 
 - The widget is a borderless, always-on-top Tk window. That works on X11 and on XWayland. On some pure Wayland compositors it may not stay on top, but notifications still work.
 - nudgling is a fan project, not affiliated with Anthropic.
+
+## Regenerating the images
+
+`docs/*.svg` are drawn by the same code as the live widget, and Tk isn't needed:
+
+```bash
+python3 nudgling.py --export docs
+```
 
 ## License
 

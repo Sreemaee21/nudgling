@@ -3,22 +3,30 @@
 
 It listens for Claude Code hook events (sent from any machine, e.g. a box you
 SSH into, over Tailscale/LAN) and shows them as a floating widget with a little
-blob whose mood follows your sessions:
+pet whose mood follows your sessions:
 
-    sleepy  (- -)  nothing going on
-    busy    (o o)  Claude is working
-    happy   (^ ^)  Claude finished
-    alarmed (O O)  Claude needs your input
+    sleepy   nothing going on
+    busy     Claude is working
+    happy    Claude finished
+    alarmed  Claude needs your input
 
 Done / needs-input events also fire a desktop notification + sound.
 
-Controls: drag to move · click a session row to dismiss it · right-click to quit.
+Pets: blob (default), cat, ghost, robot. Pick one with --pet NAME,
+NUDGLING_PET=NAME, or the right-click menu (your choice is remembered).
+
+Controls: drag to move · click a session row to dismiss it · right-click for menu.
 
 Config (env vars or ~/.config/nudgling/config.env):
     NUDGLING_TOKEN   shared secret (required, must match the hook side)
     NUDGLING_PORT    default 8765
     NUDGLING_BIND    default 0.0.0.0 (set to your Tailscale IP to restrict)
     NUDGLING_SOUND   1/0, default 1
+    NUDGLING_PET     blob | cat | ghost | robot
+
+Other commands:
+    nudgling --demo            run through all moods with fake sessions
+    nudgling --export DIR      write SVG previews of every pet (no Tk needed)
 """
 import json
 import math
@@ -29,15 +37,16 @@ import subprocess
 import sys
 import threading
 import time
-import tkinter as tk
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
+
+CONFIG_DIR = os.path.expanduser("~/.config/nudgling")
 
 
 def load_config():
     cfg = {}
-    path = os.path.expanduser("~/.config/nudgling/config.env")
+    path = os.path.join(CONFIG_DIR, "config.env")
     if os.path.exists(path):
         with open(path) as f:
             for line in f:
@@ -56,8 +65,10 @@ TOKEN = CFG.get("NUDGLING_TOKEN", "")
 SOUND = CFG.get("NUDGLING_SOUND", "1") != "0"
 
 # palette
-BG, PANEL, FG, MUTED = "#1e1e2e", "#28283d", "#cdd6f4", "#6c7086"
-BLOB = {"idle": "#b4befe", "working": "#89b4fa", "done": "#a6e3a1", "attention": "#fab387"}
+BG, PANEL, FG, MUTED, INK = "#1e1e2e", "#28283d", "#cdd6f4", "#6c7086", "#1e1e2e"
+SHADOW, BLUSH, GOLD = "#181825", "#f5c2e7", "#f9e2af"
+MOOD_COLOR = {"idle": "#b4befe", "working": "#89b4fa", "done": "#a6e3a1", "attention": "#fab387"}
+MOODS = ("idle", "working", "done", "attention")
 STATUS = {
     "working":   ("✦", "working"),
     "done":      ("✔", "done!"),
@@ -69,6 +80,319 @@ LINES = {
     "done": "all done!",
     "attention": "psst! over here",
 }
+
+
+# ───────────────────────────── drawing backends ─────────────────────────────
+# Pets are drawn through a tiny painter interface so the same code renders
+# on a Tk canvas (the live widget) and to SVG (README screenshots).
+
+class TkPainter:
+    def __init__(self, canvas):
+        self.c = canvas
+
+    def clear(self):
+        self.c.delete("all")
+
+    def oval(self, x0, y0, x1, y1, fill="", outline="", width=1):
+        self.c.create_oval(x0, y0, x1, y1, fill=fill, outline=outline, width=width)
+
+    def line(self, pts, fill, width=2, smooth=False):
+        self.c.create_line(*pts, fill=fill, width=width, smooth=smooth,
+                           capstyle="round", joinstyle="round")
+
+    def arc(self, x0, y0, x1, y1, start, extent, outline, width=2):
+        self.c.create_arc(x0, y0, x1, y1, start=start, extent=extent,
+                          style="arc", outline=outline, width=width)
+
+    def poly(self, pts, fill, outline="", width=1, smooth=False):
+        self.c.create_polygon(*pts, fill=fill, outline=outline, width=width, smooth=smooth)
+
+    def text(self, x, y, s, fill, size=9, bold=False):
+        self.c.create_text(x, y, text=s, fill=fill,
+                           font=("Sans", size, "bold" if bold else "normal"))
+
+
+def _pairs(pts):
+    return [(pts[i], pts[i + 1]) for i in range(0, len(pts), 2)]
+
+
+def _mid(a, b):
+    return ((a[0] + b[0]) / 2, (a[1] + b[1]) / 2)
+
+
+def _f(v):
+    return f"{v:.1f}".rstrip("0").rstrip(".")
+
+
+class SvgPainter:
+    """Mimics Tk's canvas semantics (incl. its quadratic-spline smoothing)."""
+
+    def __init__(self):
+        self.out = []
+        self.dx = self.dy = 0
+
+    def clear(self):
+        pass
+
+    def _p(self, x, y):
+        return f"{_f(x + self.dx)},{_f(y + self.dy)}"
+
+    def oval(self, x0, y0, x1, y1, fill="", outline="", width=1):
+        cx, cy = (x0 + x1) / 2 + self.dx, (y0 + y1) / 2 + self.dy
+        stroke = f' stroke="{outline}" stroke-width="{width}"' if outline else ""
+        self.out.append(f'<ellipse cx="{_f(cx)}" cy="{_f(cy)}" rx="{_f(abs(x1 - x0) / 2)}" '
+                        f'ry="{_f(abs(y1 - y0) / 2)}" fill="{fill or "none"}"{stroke}/>')
+
+    def _smooth_path(self, pts, closed):
+        P = _pairs(pts)
+        if closed:
+            d = f"M{self._p(*_mid(P[-1], P[0]))}"
+            for i, p in enumerate(P):
+                d += f" Q{self._p(*p)} {self._p(*_mid(p, P[(i + 1) % len(P)]))}"
+            return d + " Z"
+        if len(P) < 3:
+            return "M" + " L".join(self._p(*p) for p in P)
+        d = f"M{self._p(*P[0])}"
+        for i in range(1, len(P) - 1):
+            end = P[i + 1] if i == len(P) - 2 else _mid(P[i], P[i + 1])
+            d += f" Q{self._p(*P[i])} {self._p(*end)}"
+        return d
+
+    def line(self, pts, fill, width=2, smooth=False):
+        d = self._smooth_path(pts, False) if smooth else \
+            "M" + " L".join(self._p(*p) for p in _pairs(pts))
+        self.out.append(f'<path d="{d}" fill="none" stroke="{fill}" stroke-width="{width}" '
+                        f'stroke-linecap="round" stroke-linejoin="round"/>')
+
+    def arc(self, x0, y0, x1, y1, start, extent, outline, width=2):
+        cx, cy, rx, ry = (x0 + x1) / 2, (y0 + y1) / 2, abs(x1 - x0) / 2, abs(y1 - y0) / 2
+        a0, a1 = math.radians(start), math.radians(start + extent)
+        p0 = (cx + rx * math.cos(a0), cy - ry * math.sin(a0))
+        p1 = (cx + rx * math.cos(a1), cy - ry * math.sin(a1))
+        large = 1 if abs(extent) > 180 else 0
+        sweep = 0 if extent > 0 else 1
+        self.out.append(f'<path d="M{self._p(*p0)} A{_f(rx)},{_f(ry)} 0 {large} {sweep} '
+                        f'{self._p(*p1)}" fill="none" stroke="{outline}" stroke-width="{width}" '
+                        f'stroke-linecap="round"/>')
+
+    def poly(self, pts, fill, outline="", width=1, smooth=False):
+        d = self._smooth_path(pts, True) if smooth else \
+            "M" + " L".join(self._p(*p) for p in _pairs(pts)) + " Z"
+        stroke = f' stroke="{outline}" stroke-width="{width}"' if outline else ""
+        self.out.append(f'<path d="{d}" fill="{fill}"{stroke}/>')
+
+    def text(self, x, y, s, fill, size=9, bold=False, anchor="middle", italic=False):
+        s = s.replace("&", "&amp;").replace("<", "&lt;")
+        w = ' font-weight="bold"' if bold else ""
+        it = ' font-style="italic"' if italic else ""
+        # Tk font sizes are points; at 96dpi that is ~1.33px
+        self.out.append(f'<text x="{_f(x + self.dx)}" y="{_f(y + self.dy)}" fill="{fill}" '
+                        f'font-family="DejaVu Sans, Verdana, sans-serif" font-size="{_f(size * 1.33)}"'
+                        f'{w}{it} text-anchor="{anchor}" dominant-baseline="central">{s}</text>')
+
+
+# ──────────────────────────────────── pets ───────────────────────────────────
+
+PET_W, PET_H = 96, 92
+
+
+def rounded_rect(x0, y0, x1, y1, r):
+    """Point list for a smooth=True polygon that renders as a rounded rectangle."""
+    return [x0 + r, y0, x0 + r, y0, x1 - r, y0, x1 - r, y0, x1, y0, x1, y0 + r, x1, y0 + r,
+            x1, y1 - r, x1, y1 - r, x1, y1, x1 - r, y1, x1 - r, y1, x0 + r, y1, x0 + r, y1,
+            x0, y1, x0, y1 - r, x0, y1 - r, x0, y0 + r, x0, y0 + r, x0, y0]
+
+
+def bounce(mood, t):
+    if mood == "done":
+        return -abs(math.sin(t * 2.2)) * 7
+    if mood == "attention":
+        return math.sin(t * 9) * 1.5
+    if mood == "working":
+        return math.sin(t * 3) * 2.5
+    return math.sin(t * 1.2) * 1.5
+
+
+def face(p, cx, ey, mood, t, blinking, ink=INK, gap=11, cheeks=True):
+    if cheeks:
+        p.oval(cx - gap - 14, ey + 6, cx - gap - 4, ey + 12, fill=BLUSH)
+        p.oval(cx + gap + 4, ey + 6, cx + gap + 14, ey + 12, fill=BLUSH)
+    for ex in (cx - gap, cx + gap):
+        if mood == "idle" or blinking:
+            p.line([ex - 4, ey, ex + 4, ey], fill=ink, width=2)
+        elif mood == "done":
+            p.line([ex - 5, ey + 2, ex, ey - 3, ex + 5, ey + 2], fill=ink, width=2.5)
+        elif mood == "attention":
+            p.oval(ex - 5, ey - 5, ex + 5, ey + 5, fill="white", outline=ink, width=2)
+            p.oval(ex - 2, ey - 2, ex + 2, ey + 2, fill=ink)
+        else:  # working: eyes darting side to side
+            off = math.sin(t * 2) * 2
+            p.oval(ex - 3 + off, ey - 3, ex + 3 + off, ey + 3, fill=ink)
+    my = ey + 9
+    if mood == "done":
+        p.arc(cx - 6, my - 6, cx + 6, my + 5, 200, 140, outline=ink, width=2)
+    elif mood == "attention":
+        p.oval(cx - 3, my - 2, cx + 3, my + 4, fill=ink)
+    elif mood == "working":
+        p.line([cx - 3, my, cx + 3, my], fill=ink, width=2)
+    else:
+        p.arc(cx - 3, my - 3, cx + 3, my + 2, 200, 140, outline=ink, width=1.5)
+
+
+def props(p, cx, top, mood, t, col, bang=1):
+    if mood == "idle":
+        z = (t * 8) % 24
+        p.text(cx + 32, top - z / 2 + 4, "z", fill=MUTED, size=8 + int(z / 8))
+    elif mood == "working":
+        for i in range(3):
+            a = t * 2.5 + i * 2.09
+            p.text(cx + math.cos(a) * 40, top + 16 + math.sin(a) * 10, "·",
+                   fill=col, size=14, bold=True)
+    elif mood == "done":
+        for i, (px, py) in enumerate(((-38, 10), (36, 4), (30, 34))):
+            if int(t * 3 + i) % 3:
+                p.text(cx + px, top + py, "✦", fill=GOLD, size=9)
+    elif mood == "attention":
+        p.text(cx + 36 * bang, top + 4, "!", fill=col, size=14, bold=True)
+
+
+def draw_blob(p, mood, t, blinking):
+    cx, base, col = PET_W / 2, PET_H - 10, MOOD_COLOR[mood]
+    dy = bounce(mood, t)
+    sq = 1 + (0.06 * math.sin(t * 2.2) if mood == "done" else 0.03 * math.sin(t * 1.2))
+    w, h = 34 * sq, 30 / sq
+    top = base - 2 * h + dy
+    p.oval(cx - 26, base - 3, cx + 26, base + 5, fill=SHADOW)
+    p.oval(cx - w, top, cx + w, base + dy, fill=col)
+    sx = cx + 6  # sprout
+    p.line([sx, top + 3, sx + 5, top - 9], fill=col, width=3)
+    p.oval(sx + 1, top - 15, sx + 10, top - 6, fill=GOLD if mood == "attention" else col)
+    face(p, cx, top + h * 0.85, mood, t, blinking)
+    props(p, cx, top, mood, t, col)
+
+
+def draw_cat(p, mood, t, blinking):
+    cx, base, col = PET_W / 2 - 4, PET_H - 10, MOOD_COLOR[mood]
+    dy = bounce(mood, t) * 0.8
+    w, h = 30, 26
+    top = base - 2 * h + dy
+    p.oval(cx - 26, base - 3, cx + 30, base + 5, fill=SHADOW)
+    # tail (wags faster when happy)
+    wag = math.sin(t * (6 if mood == "done" else 1.5)) * (7 if mood == "done" else 3)
+    p.line([cx + 24, base - 6 + dy, cx + 40, base - 14 + dy, cx + 38 + wag, top + 8],
+           fill=col, width=6, smooth=True)
+    # ears
+    for s in (-1, 1):
+        p.poly([cx + s * 26, top + 16, cx + s * 22, top - 8, cx + s * 6, top + 4], fill=col)
+        p.poly([cx + s * 21, top + 10, cx + s * 20, top - 1, cx + s * 11, top + 5], fill=BLUSH)
+    p.oval(cx - w, top, cx + w, base + dy, fill=col)
+    ey = top + h * 0.8
+    face(p, cx, ey, mood, t, blinking, gap=10)
+    for s in (-1, 1):  # whiskers
+        p.line([cx + s * 16, ey + 9, cx + s * 30, ey + 6], fill=INK, width=1)
+        p.line([cx + s * 16, ey + 12, cx + s * 30, ey + 13], fill=INK, width=1)
+    props(p, cx + 2, top, mood, t, col, bang=-1)
+
+
+def draw_ghost(p, mood, t, blinking):
+    cx, col = PET_W / 2, MOOD_COLOR[mood]
+    float_y = math.sin(t * 1.6) * 3 + bounce(mood, t) * 0.7
+    y0 = PET_H - 66 + float_y
+    bottom = y0 + 50
+    L, R = cx - 26, cx + 26
+    sh = 18 - float_y  # shadow shrinks as it floats higher
+    p.oval(cx - sh, PET_H - 7, cx + sh, PET_H - 1, fill=SHADOW)
+    pts = [L, bottom, L, y0 + 18, L + 3, y0, cx, y0 - 8, R - 3, y0, R, y0 + 18, R, bottom]
+    n = 4  # wavy hem
+    for i in range(1, n * 2):
+        x = R - (R - L) * i / (n * 2)
+        wave = 7 if i % 2 else 0
+        pts += [x, bottom - wave + math.sin(t * 3 + i) * 1.5]
+    p.poly(pts, fill=col, smooth=True)
+    face(p, cx, y0 + 20, mood, t, blinking, gap=10)
+    props(p, cx, y0, mood, t, col)
+
+
+def draw_robot(p, mood, t, blinking):
+    cx, base, col = PET_W / 2, PET_H - 10, MOOD_COLOR[mood]
+    dy = bounce(mood, t) * 0.6
+    top, bot = base - 48 + dy, base + dy
+    p.oval(cx - 26, base - 3, cx + 26, base + 5, fill=SHADOW)
+    # antenna
+    p.line([cx, top, cx, top - 9], fill=col, width=2)
+    lit = mood == "attention" or (mood == "working" and int(t * 4) % 2)
+    p.oval(cx - 4, top - 15, cx + 4, top - 7, fill=GOLD if lit else col)
+    # ears / bolts
+    for s in (-1, 1):
+        p.poly(rounded_rect(cx + s * 26 - 4, top + 16, cx + s * 26 + 4, top + 32, 3),
+               fill=col, smooth=True)
+    p.poly(rounded_rect(cx - 26, top, cx + 26, bot, 10), fill=col, smooth=True)
+    # screen face with glowing features
+    p.poly(rounded_rect(cx - 19, top + 7, cx + 19, top + 37, 7), fill=INK, smooth=True)
+    face(p, cx, top + 18, mood, t, blinking, ink=col, gap=9, cheeks=False)
+    props(p, cx, top, mood, t, col)
+
+
+PETS = {"blob": draw_blob, "cat": draw_cat, "ghost": draw_ghost, "robot": draw_robot}
+
+
+def draw_pet(p, pet, mood, t, blinking=False):
+    PETS.get(pet, draw_blob)(p, mood, t, blinking)
+
+
+# ────────────────────────────────── export ───────────────────────────────────
+
+# hand-picked animation times that make each mood read well in a still
+STILL_T = {"idle": 0.4, "working": 0.3, "done": 0.75, "attention": 0.0}
+
+
+def _svg(w, h, body, radius=14):
+    return (f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" '
+            f'viewBox="0 0 {w} {h}"><rect width="{w}" height="{h}" rx="{radius}" fill="{BG}"/>'
+            + "".join(body) + "</svg>\n")
+
+
+def export(outdir):
+    os.makedirs(outdir, exist_ok=True)
+    # 1) gallery: every pet in every mood
+    cw, ch, lw, top = 110, 100, 64, 26
+    p = SvgPainter()
+    for j, mood in enumerate(MOODS):
+        p.dx, p.dy = 0, 0
+        p.text(lw + j * cw + cw / 2, 18, {"idle": "sleepy", "working": "working",
+               "done": "done", "attention": "needs you"}[mood],
+               fill=MOOD_COLOR[mood], size=9, bold=True)
+    for i, pet in enumerate(PETS):
+        p.dx, p.dy = 0, 0
+        p.text(12, top + i * ch + PET_H / 2, pet, fill=FG, size=9, bold=True, anchor="start")
+        for j, mood in enumerate(MOODS):
+            p.dx, p.dy = lw + j * cw + (cw - PET_W) / 2, top + i * ch
+            draw_pet(p, pet, mood, STILL_T[mood])
+    with open(os.path.join(outdir, "pets.svg"), "w") as f:
+        f.write(_svg(lw + cw * 4 + 6, top + ch * len(PETS) + 4, p.out))
+
+    # 2) a tiny mock of the widget itself
+    w, h = 280, 160
+    p = SvgPainter()
+    p.dx, p.dy = 10, 0
+    draw_pet(p, "blob", "done", STILL_T["done"])
+    p.dx = p.dy = 0
+    p.text(116, 40, "nudgling", fill=FG, size=11, bold=True, anchor="start")
+    p.text(116, 58, "all done!", fill=MOOD_COLOR["done"], size=9, anchor="start", italic=True)
+    rows = [("✔", "webapp · dev:1", "done! · 4s", "done"),
+            ("!", "api · dev:2", "needs you · 1m", "attention")]
+    for k, (g, label, st, mood) in enumerate(rows):
+        y = 104 + k * 26
+        p.out.append(f'<rect x="8" y="{y - 11}" width="{w - 16}" height="22" rx="5" fill="{PANEL}"/>')
+        p.text(22, y, g, fill=MOOD_COLOR[mood], size=10, bold=True)
+        p.text(36, y, label, fill=FG, size=9, anchor="start")
+        p.text(w - 16, y, st, fill=MOOD_COLOR[mood], size=8, anchor="end")
+    with open(os.path.join(outdir, "widget.svg"), "w") as f:
+        f.write(_svg(w, h, p.out))
+    print(f"wrote {outdir}/pets.svg and {outdir}/widget.svg")
+
+
+# ─────────────────────────────── server + widget ─────────────────────────────
 
 events: "queue.Queue[dict]" = queue.Queue()
 
@@ -109,98 +433,31 @@ def notify(title, body, urgent=False):
             subprocess.Popen(["paplay", snd], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
-class Pet:
-    """The little blob, drawn on a canvas."""
-    W, H = 96, 78
+PET_FILE = os.path.join(CONFIG_DIR, "pet")
 
-    def __init__(self, parent):
-        self.c = tk.Canvas(parent, width=self.W, height=self.H, bg=BG, highlightthickness=0)
-        self.mood = "idle"
-        self.t = 0.0
-        self.blink = 0
 
-    def set_mood(self, mood):
-        self.mood = mood
+def saved_pet():
+    try:
+        with open(PET_FILE) as f:
+            name = f.read().strip()
+            return name if name in PETS else None
+    except OSError:
+        return None
 
-    def draw(self):
-        c, m = self.c, self.mood
-        c.delete("all")
-        self.t += 0.12
-        cx = self.W / 2
-        # bounce: gentle when idle, bouncy when happy, jittery when alarmed
-        if m == "done":
-            dy = -abs(math.sin(self.t * 2.2)) * 8
-        elif m == "attention":
-            dy = math.sin(self.t * 9) * 1.5
-        elif m == "working":
-            dy = math.sin(self.t * 3) * 2.5
-        else:
-            dy = math.sin(self.t * 1.2) * 1.5
-        base = self.H - 10
-        squish = 1 + (0.06 * math.sin(self.t * 2.2) if m == "done" else 0.03 * math.sin(self.t * 1.2))
-        w, h = 34 * squish, 30 / squish
-        top = base - 2 * h + dy
 
-        # shadow
-        c.create_oval(cx - 26, base - 3, cx + 26, base + 5, fill="#181825", outline="")
-        # body
-        col = BLOB[m]
-        c.create_oval(cx - w, top, cx + w, base + dy, fill=col, outline="")
-        # little antenna / sprout
-        sx = cx + 6
-        c.create_line(sx, top + 3, sx + 5, top - 9, fill=col, width=3, smooth=True)
-        c.create_oval(sx + 1, top - 15, sx + 10, top - 6,
-                      fill="#f9e2af" if m == "attention" else col, outline="")
-        # cheeks
-        ey = top + h * 0.85
-        c.create_oval(cx - 25, ey + 6, cx - 15, ey + 12, fill="#f5c2e7", outline="")
-        c.create_oval(cx + 15, ey + 6, cx + 25, ey + 12, fill="#f5c2e7", outline="")
-        # eyes
-        ink = "#1e1e2e"
-        self.blink = (self.blink + 1) % 70
-        blinking = self.blink > 66 and m in ("idle", "working")
-        for ex in (cx - 11, cx + 11):
-            if m == "idle" or blinking:
-                c.create_line(ex - 4, ey, ex + 4, ey, fill=ink, width=2)
-            elif m == "done":
-                c.create_line(ex - 5, ey + 2, ex, ey - 3, ex + 5, ey + 2, fill=ink, width=2.5)
-            elif m == "attention":
-                c.create_oval(ex - 5, ey - 5, ex + 5, ey + 5, fill="white", outline=ink, width=2)
-                c.create_oval(ex - 2, ey - 2, ex + 2, ey + 2, fill=ink, outline="")
-            else:  # working: eyes darting
-                off = math.sin(self.t * 2) * 2
-                c.create_oval(ex - 3 + off, ey - 3, ex + 3 + off, ey + 3, fill=ink, outline="")
-        # mouth
-        my = ey + 9
-        if m == "done":
-            c.create_arc(cx - 6, my - 6, cx + 6, my + 5, start=200, extent=140,
-                         style="arc", outline=ink, width=2)
-        elif m == "attention":
-            c.create_oval(cx - 3, my - 2, cx + 3, my + 4, fill=ink, outline="")
-        elif m == "working":
-            c.create_line(cx - 3, my, cx + 3, my, fill=ink, width=2)
-        else:
-            c.create_arc(cx - 3, my - 3, cx + 3, my + 2, start=200, extent=140,
-                         style="arc", outline=ink, width=1.5)
-        # mood props
-        if m == "idle":
-            z = (self.t * 8) % 24
-            c.create_text(cx + 30, top - z / 2 + 4, text="z", fill=MUTED, font=("Sans", 8 + int(z / 8)))
-        elif m == "working":
-            for i in range(3):
-                a = self.t * 2.5 + i * 2.09
-                c.create_text(cx + math.cos(a) * 40, top + 16 + math.sin(a) * 10,
-                              text="·", fill=col, font=("Sans", 14, "bold"))
-        elif m == "done":
-            for i, (px, py) in enumerate(((-38, 10), (36, 4), (30, 34))):
-                if int(self.t * 3 + i) % 3:
-                    c.create_text(cx + px, top + py, text="✦", fill="#f9e2af", font=("Sans", 9))
-        elif m == "attention":
-            c.create_text(cx + 34, top + 4, text="!", fill=col, font=("Sans", 14, "bold"))
+def save_pet(name):
+    try:
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        with open(PET_FILE, "w") as f:
+            f.write(name + "\n")
+    except OSError:
+        pass
 
 
 class Widget:
-    def __init__(self):
+    def __init__(self, pet):
+        import tkinter as tk
+        self.tk = tk
         self.root = tk.Tk()
         self.root.title("nudgling")
         self.root.overrideredirect(True)
@@ -213,14 +470,18 @@ class Widget:
         sw = self.root.winfo_screenwidth()
         self.root.geometry(f"+{sw - 300}+40")
 
+        self.pet = tk.StringVar(value=pet)
+        self.mood, self.t, self.blink = "idle", 0.0, 0
+
         top = tk.Frame(self.root, bg=BG)
         top.pack(fill="x", padx=10, pady=(8, 2))
-        self.pet = Pet(top)
-        self.pet.c.pack(side="left")
+        self.canvas = tk.Canvas(top, width=PET_W, height=PET_H, bg=BG, highlightthickness=0)
+        self.canvas.pack(side="left")
+        self.painter = TkPainter(self.canvas)
         info = tk.Frame(top, bg=BG)
         info.pack(side="left", fill="both", expand=True, padx=(6, 0))
         tk.Label(info, text="nudgling", bg=BG, fg=FG, font=("Sans", 11, "bold"),
-                 anchor="w").pack(fill="x", pady=(14, 0))
+                 anchor="w").pack(fill="x", pady=(24, 0))
         self.say = tk.Label(info, text=LINES["idle"], bg=BG, fg=MUTED,
                             font=("Sans", 9, "italic"), anchor="w")
         self.say.pack(fill="x")
@@ -231,14 +492,29 @@ class Widget:
                               font=("Sans", 8), pady=2)
         self.empty.pack()
 
+        self.menu = tk.Menu(self.root, tearoff=0, bg=PANEL, fg=FG,
+                            activebackground="#3b3b58", activeforeground=FG)
+        pets = tk.Menu(self.menu, tearoff=0, bg=PANEL, fg=FG,
+                       activebackground="#3b3b58", activeforeground=FG)
+        for name in PETS:
+            pets.add_radiobutton(label=name, variable=self.pet, value=name,
+                                 command=lambda n=name: save_pet(n))
+        self.menu.add_cascade(label="Pet", menu=pets)
+        self.menu.add_command(label="Clear sessions", command=self._clear)
+        self.menu.add_separator()
+        self.menu.add_command(label="Quit", command=self.root.destroy)
+
         self.sessions = {}
-        for w in (self.root, top, self.pet.c, info, self.say):
+        for w in (self.root, top, self.canvas, info, self.say, self.empty):
             w.bind("<Button-1>", self._start_drag)
             w.bind("<B1-Motion>", self._drag)
-            w.bind("<Button-3>", lambda e: self.root.destroy())
+            w.bind("<Button-3>", self._popup)
         self._animate()
         self.root.after(200, self._poll)
         self.root.after(1000, self._tick)
+
+    def _popup(self, e):
+        self.menu.tk_popup(e.x_root, e.y_root)
 
     # dragging
     def _start_drag(self, e):
@@ -249,7 +525,11 @@ class Widget:
 
     # loops
     def _animate(self):
-        self.pet.draw()
+        self.t += 0.12
+        self.blink = (self.blink + 1) % 70
+        self.painter.clear()
+        draw_pet(self.painter, self.pet.get(), self.mood, self.t,
+                 blinking=self.blink > 66 and self.mood in ("idle", "working"))
         self.root.after(50, self._animate)
 
     def _poll(self):
@@ -273,12 +553,13 @@ class Widget:
             mood = "working"
         else:
             mood = "idle"
-        if mood != self.pet.mood:
-            self.pet.set_mood(mood)
-            self.say.config(text=LINES[mood], fg=BLOB[mood] if mood != "idle" else MUTED)
+        if mood != self.mood:
+            self.mood = mood
+            self.say.config(text=LINES[mood], fg=MOOD_COLOR[mood] if mood != "idle" else MUTED)
 
     # events
     def _handle(self, ev):
+        tk = self.tk
         state = ev.get("state", "done")
         if state not in STATUS:
             return
@@ -298,13 +579,12 @@ class Widget:
             s = {"frame": f, "icon": icon, "text": text, "status": status}
             for w in (f, icon, text, status):
                 w.bind("<Button-1>", lambda e, k=key: self._dismiss(k))
-                w.bind("<Button-3>", lambda e: self.root.destroy())
+                w.bind("<Button-3>", self._popup)
             self.sessions[key] = s
             self.empty.pack_forget()
             f.pack(fill="x", pady=2)
         s.update(state=state, label=label, ts=time.time())
         self._render(s)
-        self._update_mood()
 
         if state == "done":
             notify("Claude is done ✔", label)
@@ -315,7 +595,7 @@ class Widget:
 
     def _render(self, s):
         glyph, word = STATUS[s["state"]]
-        color = BLOB[s["state"]]
+        color = MOOD_COLOR[s["state"]]
         age = int(time.time() - s["ts"])
         ago = f"{age}s" if age < 60 else f"{age // 60}m" if age < 3600 else f"{age // 3600}h"
         s["icon"].config(text=glyph, fg=color)
@@ -339,13 +619,35 @@ class Widget:
             self.empty.pack()
         self._update_mood()
 
+    def _clear(self):
+        for k in list(self.sessions):
+            self._dismiss(k)
+
     def run(self):
         self.root.mainloop()
+
+
+def arg_value(flag):
+    if flag in sys.argv:
+        i = sys.argv.index(flag)
+        if i + 1 < len(sys.argv):
+            return sys.argv[i + 1]
+        sys.exit(f"nudgling: {flag} needs a value")
+    return None
 
 
 def main():
     if "--version" in sys.argv:
         print(__version__); return
+    if "-h" in sys.argv or "--help" in sys.argv:
+        print(__doc__); return
+    out = arg_value("--export")
+    if out:
+        export(out); return
+
+    pet = arg_value("--pet") or CFG.get("NUDGLING_PET") or saved_pet() or "blob"
+    if pet not in PETS:
+        sys.exit(f"nudgling: unknown pet '{pet}' (choose from: {', '.join(PETS)})")
     if not TOKEN:
         sys.exit("nudgling: set NUDGLING_TOKEN (env or ~/.config/nudgling/config.env)")
     srv = ThreadingHTTPServer((BIND, PORT), Handler)
@@ -359,7 +661,7 @@ def main():
                 events.put({"state": st, "session_id": sid, "cwd": cwd, "tmux": f"dev:{sid}",
                             "message": "Claude needs your permission to use Bash"})
         threading.Thread(target=demo, daemon=True).start()
-    Widget().run()
+    Widget(pet).run()
 
 
 if __name__ == "__main__":
